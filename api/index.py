@@ -19,7 +19,6 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# বিশ্বসেরা RMBG-1.4 কোয়ান্টাইজড মডেল (৪৪ এমবি)
 MODEL_PATH = "/tmp/rmbg14_quant.onnx"
 MODEL_URL = "https://huggingface.co/briaai/RMBG-1.4/resolve/main/onnx/model_quantized.onnx"
 session = None
@@ -65,19 +64,17 @@ async def remove_bg(
         img = Image.open(io.BytesIO(contents)).convert("RGB")
         orig_w, orig_h = img.size
 
-        # ১. ১০২৪x১০২৪ সাইজে রিসাইজ
+        # ১. ১০২৪x১০২৪ সাইজে অপটিমাল রিসাইজ
         img_resized = img.resize((1024, 1024), Image.Resampling.BILINEAR)
 
-        # ২. অফিসিয়াল RMBG-1.4 সঠিক প্রি-প্রসেসিং: (pixel / 255.0 - 0.5) / 1.0
-        # (কোনো ভুল 0.229 গুণ থাকবে না, পিক্সেল থাকবে পারফেক্ট -০.৫ থেকে +০.৫ রেঞ্জে)
+        # ২. অফিসিয়াল প্রি-প্রসেসিং: (pixel / 255.0 - 0.5) / 1.0
         img_data = np.array(img_resized).astype(np.float32) / 255.0
         img_data = (img_data - 0.5) / 1.0
 
-        # ৩. টেনসর শেইপ [1, 3, 1024, 1024]
         img_data = np.transpose(img_data, (2, 0, 1))
         img_data = np.expand_dims(img_data, axis=0)
 
-        # ৪. মডেল রান করা
+        # ৩. মডেল ইনফারেন্স
         ort_sess = get_session()
         input_name = ort_sess.get_inputs()[0].name
         outputs = ort_sess.run(None, {input_name: img_data})
@@ -86,24 +83,25 @@ async def remove_bg(
         while len(pred.shape) > 2:
             pred = pred[0]
 
-        # ৫. লজিটস অটোমেটিক সিগময়েড চেক
-        if np.min(pred) < 0.0 or np.max(pred) > 1.0:
-            pred = 1.0 / (1.0 + np.exp(-pred))
-
-        # ৬. প্রবাবিলিটি নরমাল স্কেলিং
+        # ৪. র' স্কেলিং
         mi = float(np.min(pred))
         ma = float(np.max(pred))
         if ma > mi:
             norm = (pred - mi) / (ma - mi)
         else:
             norm = pred
-        norm = np.clip(norm, 0.0, 1.0)
 
-        # ৭. আল্ট্রা-এইচডি ১০২৪ মাস্ককে আসল সাইজে রিসাইজ
+        # ৫. নয়েজ কিলার ও ব্যাকগ্রাউন্ড ক্লিনআপ ফিল্টার
+        # ৩৫%-এর নিচে থাকা সব অবশিষ্টাংশ, সাদা দাগ ও লো-কোয়ালিটি নয়েজ ১০০% ভ্যানিশ
+        # ৬৫%-এর ওপরে থাকা মূল মানুষ/সাবজেক্ট ১০০% সলিড
+        norm = np.clip((norm - 0.35) / (0.65 - 0.35), 0.0, 1.0)
+        norm = norm * norm * (3.0 - 2.0 * norm)  # মসৃণ হারমাইট কার্ভ
+
+        # ৬. আল্ট্রা-এইচডি মাস্কিং
         mask_1024 = Image.fromarray((norm * 255.0).astype(np.uint8), mode="L")
-        mask = mask_1024.resize((orig_w, orig_h), Image.Resampling.BILINEAR)
+        mask = mask_1024.resize((orig_w, orig_h), Image.Resampling.LANCZOS)
 
-        # ৮. ট্রান্সপারেন্ট পিএনজি তৈরি
+        # ৭. ট্রান্সপারেন্ট পিএনজি তৈরি
         result = img.copy()
         result.putalpha(mask)
 
