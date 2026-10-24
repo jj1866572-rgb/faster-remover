@@ -7,9 +7,9 @@ from fastapi.responses import Response
 from fastapi.middleware.cors import CORSMiddleware
 import numpy as np
 import onnxruntime as ort
-from PIL import Image
+from PIL import Image, ImageFilter
 
-app = FastAPI(title="Faster Remover Pro 10X API")
+app = FastAPI(title="Faster Remover Ultra Studio API")
 
 app.add_middleware(
     CORSMiddleware,
@@ -19,21 +19,27 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-MODEL_PATH = "/tmp/rmbg14_quant.onnx"
-MODEL_URL = "https://huggingface.co/briaai/RMBG-1.4/resolve/main/onnx/model_quantized.onnx"
+# বিশ্বমানের silueta ফুল-প্রিসিশন FP32 ইঞ্জিন (৪৩.৯ এমবি - নো নয়েজ, নো গ্রিন ডট)
+MODEL_PATH = "/tmp/silueta.onnx"
+PRIMARY_URL = "https://github.com/danielgatis/rembg/releases/download/v0.0.0/silueta.onnx"
+FALLBACK_URL = "https://huggingface.co/martintomov/comfy/resolve/main/rembg/silueta.onnx"
+
 session = None
 
 def get_session():
     global session
     if session is None:
         if not os.path.exists(MODEL_PATH):
-            req = urllib.request.Request(
-                MODEL_URL, 
-                headers={'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)'}
-            )
-            with urllib.request.urlopen(req) as resp, open(MODEL_PATH, 'wb') as f:
-                f.write(resp.read())
-        
+            headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)'}
+            try:
+                req = urllib.request.Request(PRIMARY_URL, headers=headers)
+                with urllib.request.urlopen(req) as resp, open(MODEL_PATH, 'wb') as f:
+                    f.write(resp.read())
+            except Exception:
+                req = urllib.request.Request(FALLBACK_URL, headers=headers)
+                with urllib.request.urlopen(req) as resp, open(MODEL_PATH, 'wb') as f:
+                    f.write(resp.read())
+
         opts = ort.SessionOptions()
         opts.intra_op_num_threads = 2
         session = ort.InferenceSession(MODEL_PATH, opts, providers=['CPUExecutionProvider'])
@@ -43,7 +49,7 @@ def get_session():
 @app.get("/api")
 @app.get("/api/index.py")
 def health():
-    return {"status": "online", "model": "RMBG-1.4 10X Ultra HD Ready"}
+    return {"status": "online", "model": "silueta Studio Quality FP32 Ready"}
 
 @app.post("/")
 @app.post("/api")
@@ -64,44 +70,47 @@ async def remove_bg(
         img = Image.open(io.BytesIO(contents)).convert("RGB")
         orig_w, orig_h = img.size
 
-        # ১. ১০২৪x১০২৪ সাইজে অপটিমাল রিসাইজ
-        img_resized = img.resize((1024, 1024), Image.Resampling.BILINEAR)
-
-        # ২. অফিসিয়াল প্রি-প্রসেসিং: (pixel / 255.0 - 0.5) / 1.0
+        # ১. ৩২০x৩২০ ইমেজ প্রি-প্রসেসিং (স্ট্যান্ডার্ড ImageNet নরমালাইজেশন)
+        img_resized = img.resize((320, 320), Image.Resampling.BILINEAR)
         img_data = np.array(img_resized).astype(np.float32) / 255.0
-        img_data = (img_data - 0.5) / 1.0
-
+        
+        mean = np.array([0.485, 0.456, 0.406], dtype=np.float32)
+        std = np.array([0.229, 0.224, 0.225], dtype=np.float32)
+        img_data = (img_data - mean) / std
         img_data = np.transpose(img_data, (2, 0, 1))
         img_data = np.expand_dims(img_data, axis=0)
 
-        # ৩. মডেল ইনফারেন্স
+        # ২. silueta এআই মডেল রান
         ort_sess = get_session()
         input_name = ort_sess.get_inputs()[0].name
         outputs = ort_sess.run(None, {input_name: img_data})
-        
-        pred = outputs[0]
-        while len(pred.shape) > 2:
-            pred = pred[0]
+        pred = outputs[0][0, 0]
 
-        # ৪. র' স্কেলিং
-        mi = float(np.min(pred))
-        ma = float(np.max(pred))
-        if ma > mi:
-            norm = (pred - mi) / (ma - mi)
-        else:
-            norm = pred
+        # ৩. প্রবাবিলিটি নরমালাইজেশন
+        d_min, d_max = pred.min(), pred.max()
+        norm = (pred - d_min) / (d_max - d_min + 1e-8)
+        norm = np.clip(norm, 0.0, 1.0)
 
-        # ৫. নয়েজ কিলার ও ব্যাকগ্রাউন্ড ক্লিনআপ ফিল্টার
-        # ৩৫%-এর নিচে থাকা সব অবশিষ্টাংশ, সাদা দাগ ও লো-কোয়ালিটি নয়েজ ১০০% ভ্যানিশ
-        # ৬৫%-এর ওপরে থাকা মূল মানুষ/সাবজেক্ট ১০০% সলিড
-        norm = np.clip((norm - 0.35) / (0.65 - 0.35), 0.0, 1.0)
+        # ৪. ব্যাকগ্রাউন্ড ক্লিনআপ কার্ভ (পেছনের ক্যাফে, টেবিল ও গাছপালা ১০০% নিশ্চিহ্ন করা)
+        # ০.৪০ এর নিচে থাকা সব ব্যাকগ্রাউন্ড পুরোপুরি জিরো
+        # ০.৭০ এর ওপরে থাকা মূল মানুষ ১০০% সলিড
+        norm = np.clip((norm - 0.40) / (0.70 - 0.40), 0.0, 1.0)
         norm = norm * norm * (3.0 - 2.0 * norm)  # মসৃণ হারমাইট কার্ভ
 
-        # ৬. আল্ট্রা-এইচডি মাস্কিং
-        mask_1024 = Image.fromarray((norm * 255.0).astype(np.uint8), mode="L")
-        mask = mask_1024.resize((orig_w, orig_h), Image.Resampling.LANCZOS)
+        # ৫. হাই-রেজুলিউশন মাস্ক আসল সাইজে নেওয়া
+        mask_320 = (norm * 255.0).astype(np.uint8)
+        mask = Image.fromarray(mask_320, mode="L").resize(
+            (orig_w, orig_h), Image.Resampling.LANCZOS
+        )
 
-        # ৭. ট্রান্সপারেন্ট পিএনজি তৈরি
+        # ৬. মর্ফোলজিক্যাল স্পেকল কিলার (Opening Filter)
+        # এটি যেকোনো ভাসমান সবুজ ডট, পাতা বা নয়েজের অস্তিত্ব সম্পূর্ণ মুছে দেবে
+        mask = mask.filter(ImageFilter.MinFilter(3)).filter(ImageFilter.MaxFilter(3))
+
+        # ৭. সাব-পিক্সেল স্মুথনেস (যাতে কোনো খাবরা ভাব না থাকে)
+        mask = mask.filter(ImageFilter.GaussianBlur(radius=0.7))
+
+        # ৮. ট্রান্সপারেন্ট পিএনজি তৈরি
         result = img.copy()
         result.putalpha(mask)
 
