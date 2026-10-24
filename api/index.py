@@ -9,7 +9,7 @@ import numpy as np
 import onnxruntime as ort
 from PIL import Image
 
-app = FastAPI(title="Faster Remover 10X Pro API")
+app = FastAPI(title="Faster Remover Pro 10X API")
 
 app.add_middleware(
     CORSMiddleware,
@@ -19,7 +19,7 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# বিশ্বসেরা RMBG-1.4 কোয়ান্টাইজড আল্ট্রা-এইচডি মডেল (৪৪ এমবি)
+# বিশ্বসেরা RMBG-1.4 কোয়ান্টাইজড মডেল (৪৪ এমবি)
 MODEL_PATH = "/tmp/rmbg14_quant.onnx"
 MODEL_URL = "https://huggingface.co/briaai/RMBG-1.4/resolve/main/onnx/model_quantized.onnx"
 session = None
@@ -35,7 +35,6 @@ def get_session():
             with urllib.request.urlopen(req) as resp, open(MODEL_PATH, 'wb') as f:
                 f.write(resp.read())
         
-        # অপটিমাইজড সিপিইউ এক্সিকিউশন
         opts = ort.SessionOptions()
         opts.intra_op_num_threads = 2
         session = ort.InferenceSession(MODEL_PATH, opts, providers=['CPUExecutionProvider'])
@@ -66,32 +65,45 @@ async def remove_bg(
         img = Image.open(io.BytesIO(contents)).convert("RGB")
         orig_w, orig_h = img.size
 
-        # ১. ১০২৪x১০২৪ আল্ট্রা-এইচডি প্রি-প্রসেসিং (১০ গুণ বেশি ডিটেইল)
+        # ১. ১০২৪x১০২৪ সাইজে রিসাইজ
         img_resized = img.resize((1024, 1024), Image.Resampling.BILINEAR)
+
+        # ২. অফিসিয়াল RMBG-1.4 সঠিক প্রি-প্রসেসিং: (pixel / 255.0 - 0.5) / 1.0
+        # (কোনো ভুল 0.229 গুণ থাকবে না, পিক্সেল থাকবে পারফেক্ট -০.৫ থেকে +০.৫ রেঞ্জে)
         img_data = np.array(img_resized).astype(np.float32) / 255.0
-        
-        mean = np.array([0.485, 0.456, 0.406], dtype=np.float32)
-        std = np.array([0.229, 0.224, 0.225], dtype=np.float32)
-        img_data = (img_data - mean) / std
+        img_data = (img_data - 0.5) / 1.0
+
+        # ৩. টেনসর শেইপ [1, 3, 1024, 1024]
         img_data = np.transpose(img_data, (2, 0, 1))
         img_data = np.expand_dims(img_data, axis=0)
 
-        # ২. RMBG-1.4 এআই মডেল রান
+        # ৪. মডেল রান করা
         ort_sess = get_session()
         input_name = ort_sess.get_inputs()[0].name
         outputs = ort_sess.run(None, {input_name: img_data})
-        pred = outputs[0][0, 0]
+        
+        pred = outputs[0]
+        while len(pred.shape) > 2:
+            pred = pred[0]
 
-        # ৩. প্রফেশনাল আলফা মাস্ক তৈরি
-        d_min, d_max = pred.min(), pred.max()
-        norm = (pred - d_min) / (d_max - d_min + 1e-8)
+        # ৫. লজিটস অটোমেটিক সিগময়েড চেক
+        if np.min(pred) < 0.0 or np.max(pred) > 1.0:
+            pred = 1.0 / (1.0 + np.exp(-pred))
+
+        # ৬. প্রবাবিলিটি নরমাল স্কেলিং
+        mi = float(np.min(pred))
+        ma = float(np.max(pred))
+        if ma > mi:
+            norm = (pred - mi) / (ma - mi)
+        else:
+            norm = pred
         norm = np.clip(norm, 0.0, 1.0)
 
-        # ৪. হাই-রেজুলিউশন মাস্ক আসল সাইজে নেওয়া
+        # ৭. আল্ট্রা-এইচডি ১০২৪ মাস্ককে আসল সাইজে রিসাইজ
         mask_1024 = Image.fromarray((norm * 255.0).astype(np.uint8), mode="L")
-        mask = mask_1024.resize((orig_w, orig_h), Image.Resampling.LANCZOS)
+        mask = mask_1024.resize((orig_w, orig_h), Image.Resampling.BILINEAR)
 
-        # ৫. পারফেক্ট ট্রান্সপারেন্ট পিএনজি
+        # ৮. ট্রান্সপারেন্ট পিএনজি তৈরি
         result = img.copy()
         result.putalpha(mask)
 
